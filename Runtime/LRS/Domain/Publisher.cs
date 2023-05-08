@@ -1,9 +1,8 @@
 using System;
 using XAPI;
+using XAPI.Metadata;
 using System.Threading.Tasks;
 using RestSharp;
-using System.Dynamic;
-using System.Collections.Generic;
 using System.Collections.Concurrent;
 using UnityEngine;
 using Util;
@@ -24,9 +23,9 @@ namespace LRS
             private Agent formAgent() {
                 bool hasEmail = PlayerPrefs.HasKey("LRSEmail");
                 bool hasAccount = PlayerPrefs.HasKey("LRSAccountId") && PlayerPrefs.HasKey("LRSHomepage");
-                if (hasEmail) 
+                if (hasEmail)
                 {
-                    return new Agent 
+                    return new Agent
                     {
                         mbox = "mailto:" + PlayerPrefs.GetString("LRSEmail"),
                         name = PlayerPrefs.GetString("LRSUsernameDisplay")
@@ -52,8 +51,8 @@ namespace LRS
             }
 
             // setters getters
-            private Task<ExpandoObject> locationTask { set; get; }
-            private static readonly ConcurrentDictionary<string, ExpandoObject> downloadCache = new ConcurrentDictionary<string, ExpandoObject> ();
+            private Task<Location> locationTask { set; get; }
+            private static readonly ConcurrentDictionary<string, Location> downloadCache = new ConcurrentDictionary<string, Location> ();
             private static readonly String VERB_URI = "http://adlnet.gov/expapi/verbs/";
             private String verbUri { get { return VERB_URI; } }
             private Sender sender { set; get; }
@@ -66,7 +65,13 @@ namespace LRS
             private String nameDisplay { get { return PlayerPrefs.GetString("LRSUsernameDisplay"); } }
             private String gameId { get { return PlayerPrefs.GetString("LRSGameId"); } }
             private String gameDisplay { get { return PlayerPrefs.GetString("LRSGameDisplay"); } }
-            
+
+            private bool hasCustomActivityEnv { get { return PlayerPrefs.HasKey("LRSActivityId") &&
+                                                             PlayerPrefs.HasKey("LRSActivityDefinition"); } }
+
+            private String customActivityId { get { return PlayerPrefs.GetString("LRSActivityId"); } }
+            private String customActivityDefinition { get { return PlayerPrefs.GetString("LRSActivityDefinition"); } }
+
             // TODO: make this optional
             private String registrationIdentifier { get { return PlayerPrefs.GetString("LRSSessionIdentifier"); } }
 
@@ -84,14 +89,14 @@ namespace LRS
 
             }
 
-            private async Task<ExpandoObject> GetLocation()
+            private async Task<Location> GetLocation()
             {
                 var response = await GetIp();
                 var ip = response.Content;
                 var client = new RestClient("http://ip-api.com");
 
                 // return whatever we get out of the cache if something exists there.
-                if (downloadCache.TryGetValue("location", out ExpandoObject location))
+                if (downloadCache.TryGetValue("location", out Location location))
                 {
                     return await Task.FromResult(location);
                 }
@@ -99,7 +104,7 @@ namespace LRS
                 // otherwise, we go ahead and populate the cache by calling the API
                 return await Task.Run(async () =>
                 {
-                    location = await client.GetJsonAsync<ExpandoObject>(string.Format("json/{0}", ip));
+                    location = await client.GetJsonAsync<Location>(string.Format("json/{0}", ip));
                     downloadCache.TryAdd("location", location);
 
                     return location;
@@ -107,35 +112,43 @@ namespace LRS
             }
 
             private async Task<Statement<Agent, Activity>> FormBasicStatement(String verbId,
-                                                                             String verbDisplay,
-                                                                             Agent user,
-                                                                             String gameId,
-                                                                             String gameDisplay,
-                                                                             String registrationIdentifier)
+                                                                              String verbDisplay,
+                                                                              Agent user,
+                                                                              String gameId,
+                                                                              String gameDisplay,
+                                                                              String registrationIdentifier)
             {
-                dynamic contextExtension = new Dictionary<String, ExpandoObject>();
-                dynamic objectDefinitionExtension = new Dictionary<String, ExpandoObject>();
-                dynamic vrSubsystemMetadata = new ExpandoObject();
-                dynamic vrSettingsMetadata = new ExpandoObject();
-                dynamic platformSettingsMetadata = new ExpandoObject();
-                platformSettingsMetadata.platform = Application.platform.ToString();
-                // determines what type of VR device the user is using
-                vrSettingsMetadata.loadedDeviceName = XR.deviceName();
+                Extension contextExtension = new Extension() {
+                    platformSettingsMetadata = new PlatformSettings() {
+                        platform = Application.platform.ToString()
+                    }
+                };
 
-                //determines whether or not VR is being used at all.
-                vrSubsystemMetadata.running = XR.isPresent();
-                objectDefinitionExtension.Add("https://docs.unity3d.com/ScriptReference/XR.XRDisplaySubsystem.html",
-                                              vrSubsystemMetadata);
-                objectDefinitionExtension.Add("https://docs.unity3d.com/ScriptReference/XR.XRSettings.html",
-                                              vrSettingsMetadata);
-                contextExtension.Add("https://docs.unity3d.com/ScriptReference/Application-platform.html",
-                                     platformSettingsMetadata);
+                Extension objectDefinitionExtension = new Extension() {
+                    vrSettingsMetadata = new VRSettings() {
+                        // determines what type of VR device the user is using
+                        loadedDeviceName = XR.deviceName()
+
+                    },
+                    vrSubsystemMetadata = new VRSubsystems() {
+                        // determines whether or not VR is being used at all
+                        running = XR.isPresent()
+                    }
+                };
 
                 // location
                 if (enableUserLocation) {
-                    dynamic loc = await this.locationTask;
-                    contextExtension.Add("http://ip-api.com/location",
-                                         loc);
+                    Location loc = await this.locationTask;
+                    contextExtension.location = loc;
+                }
+
+                String activityId = gameId;
+                String activityDefinition = gameDisplay;
+
+                // if there's a custom ActivityID in the env, set activityId to that one.
+                if (hasCustomActivityEnv) {
+                    activityId = customActivityId;
+                    activityDefinition = customActivityDefinition;
                 }
 
                 // statement construction
@@ -150,18 +163,7 @@ namespace LRS
                             enUS = verbDisplay
                         }
                     },
-                    objekt = new Activity
-                    {
-                        id = gameId,
-                        definition = new ActivityDefinition
-                        {
-                            name = new LanguageMap
-                            {
-                                enUS = gameDisplay
-                            },
-                            extensions = objectDefinitionExtension
-                        }
-                    },
+                    objekt = FormActivity(activityId, activityDefinition, objectDefinitionExtension),
                     context = new Context
                     {
                         registration = registrationIdentifier,
@@ -171,58 +173,80 @@ namespace LRS
                 };
             }
 
-            public async Task<Statement<Agent, Activity>> StartedStatement(Agent user,
-                                                                          String gameId,
-                                                                          String gameDisplay,
-                                                                          String registrationIdentifier)
+            private async Task<Statement<Agent, Activity>> FormBasicStatement(String verbId,
+                                                                              String verbDisplay,
+                                                                              Agent user,
+                                                                              String gameId,
+                                                                              String gameDisplay,
+                                                                              String registrationIdentifier,
+                                                                              String activityID,
+                                                                              String activityDescription)
             {
-                return await FormBasicStatement(formVerbId("initialized"),
-                                                "Initialized",
-                                                user,
-                                                gameId,
-                                                gameDisplay,
-                                                registrationIdentifier);
-            }
+                Statement<Agent, Activity> statement =  await FormBasicStatement(verbId,
+                                                                                 verbDisplay,
+                                                                                 user,
+                                                                                 gameId,
+                                                                                 gameDisplay,
+                                                                                 registrationIdentifier);
+                statement.objekt.id = activityID;
+                statement.objekt.definition.name.enUS = activityDescription;
+                return statement;
 
-            public async Task<Statement<Agent, Activity>> CompletedStatement(Agent user,
-                                                                            String gameId,
-                                                                            String gameDisplay,
-                                                                            String registrationIdentifier)
-            {
-                return await FormBasicStatement(formVerbId("completed"),
-                                                "Completed",
-                                                user,
-                                                gameId,
-                                                gameDisplay,
-                                                registrationIdentifier);
             }
 
 
-            public async void SendStartedStatement()
+            private Activity FormActivity(String activityID,
+                                          String activityDescription,
+                                          Extension extension)
             {
-                var statement = await StartedStatement(user,
-                                                       gameId,
-                                                       gameDisplay,
-                                                       registrationIdentifier);
-                var statementStr = statement.Serialize();
-                var response = await sender.SendStatement(statementStr);
-                Debug.Log(statementStr);
-                Debug.Log(response.Content);
-                Debug.Log(response.ResponseStatus);
+                return new Activity {
+                    id = activityID,
+                    definition = new ActivityDefinition
+                    {
+                        name = new LanguageMap
+                        {
+                            enUS = activityDescription
+                        },
+                        extensions = extension
+                    }
+                };
             }
 
-            public async void SendCompletedStatement()
-            {
-                var statement = await CompletedStatement(user,
-                                                         gameId,
-                                                         gameDisplay,
-                                                         registrationIdentifier);
-                var statementStr = statement.Serialize();
-                var response = await sender.SendStatement(statementStr);
-                Debug.Log(statementStr);
+            private void DebugStatements(string statement, RestResponse response) {
+                Debug.Log(statement);
                 Debug.Log(response.Content);
                 Debug.Log(response.ResponseStatus);
 
+            }
+
+
+            public void SendStartedStatement()
+            {
+                SendStatement(formVerbId("initialized"), "Initialized");
+
+            }
+
+            public void SendStartedStatement(String activityID,
+                                             String activityDisplay)
+            {
+                SendStatement(formVerbId("initialized"),
+                              "Initialized",
+                              activityID,
+                              activityDisplay);
+            }
+
+            public void SendCompletedStatement()
+            {
+                SendStatement(formVerbId("completed"), "Completed");
+            }
+
+            public void SendCompletedStatement(String activityID,
+                                               String activityDisplay)
+            {
+                SendStatement(formVerbId("completed"),
+                              "Completed",
+                              activityID,
+                              activityDisplay);
             }
 
             public async void SendStatement(String verbId,
@@ -236,9 +260,26 @@ namespace LRS
                                                          registrationIdentifier);
                 var statementStr = statement.Serialize();
                 var response = await sender.SendStatement(statementStr);
-                Debug.Log(statementStr);
-                Debug.Log(response.Content);
-                Debug.Log(response.ResponseStatus);
+                DebugStatements(statementStr, response);
+
+            }
+
+            public async void SendStatement(String verbId,
+                                            String verbDisplay,
+                                            String activityID,
+                                            String activityDisplay)
+            {
+                var statement = await FormBasicStatement(verbId,
+                                                         verbDisplay,
+                                                         user,
+                                                         gameId,
+                                                         gameDisplay,
+                                                         registrationIdentifier,
+                                                         activityID,
+                                                         activityDisplay);
+                var statementStr = statement.Serialize();
+                var response = await sender.SendStatement(statementStr);
+                DebugStatements(statementStr, response);
 
             }
 
@@ -257,13 +298,11 @@ namespace LRS
                                                          registrationIdentifier);
                 var statementStr = statement.Serialize();
                 var response = await sender.SendStatement(statementStr);
-                Debug.Log(statementStr);
-                Debug.Log(response.Content);
-                Debug.Log(response.ResponseStatus);
+                DebugStatements(statementStr, response);
 
             }
 
-            async void SendScratchStatement<TActor, TObjekt>(Statement<TActor, TObjekt> statement) 
+            async void SendScratchStatement<TActor, TObjekt>(Statement<TActor, TObjekt> statement)
                 where TActor: IActor
                 where TObjekt: IObjekt
             {
